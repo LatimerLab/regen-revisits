@@ -1,49 +1,51 @@
+#### Purpose: Compile existing plot data from multiple data sources; extract data for evaluating plots such as management history, disturbance history.
+
 library(tidyverse)
 library(here)
 library(sf)
 library(readxl)
 library(terra)
 
+
+### Setup: define a function `datadir()` that points to your local data directory 
 # The root of the data directory
 data_dir = readLines(here("data_dir.txt"), n=1)
-
 source(here("scripts/convenience_functions.R"))
 
-## Main CSE database compiled by Clark Richter
+#### Load plot data
+
+#### Permanently-marked (rebarred) plots:
+
+##Main CSE database compiled by Clark Richter
 richter_plots = read_excel(datadir("CSEs/richter-db-export/Plot Data.xlsx"))
 
-#### bring in the other plot locs
 
-## for Pendola, need to make sure that regen & fuel data can be linked to plot IDs.
-##!! NOTE that waiting to learn if Bassetts is rebarred (next need to ask Clark) -- only add it (from Richter spreadsheets) if it is
+#TODO: To get Bassetts data: use CSE plot list from Richter tables, merged with ?? for plot locs (originally thought welch DB but those seem to be different plots--waiting for Kevin to respond on this.)
 
-## note that there are also Rim and King from Shive if we want them
-# To get Bassetts: from Richter tables merged with Welch DB for plot locs
-
-# Pendola from Richter tables
+# Pendola fire plots from Richter tables
 pendola_plots = read_excel(datadir("CSEs/richter-additional/pendola/Plot_Data.xlsx"))
 
-# gondola and showers from hugh. Fires burned 2002. Initial survey 08-09. Revisit 2019.
+# gondola and showers fires from hugh. Fires burned 2002. Initial survey 08-09. Revisit 2019.
 gond_show_plots = read_excel(datadir("CSEs/showers-gondola/access-export/Plot_data.xlsx"))
 
 
 #### Non-rebarred (non-CSE) plots
-## bring in Welch and Young data (box: plot_level_pub.csv)
+## Welch and Young data
 welch_young_plots = read_csv(datadir("non-CSEs/young-welch-summarized/plot_level_pub.csv"))
 
-## bring in Young/Latimer JFSP data
+## Young/Latimer JFSP data
 jfsp_plots = read_excel(datadir("non-CSEs/latimer-young-summarized/Data_template_DJNY-3.xlsx"),sheet = 3)
 
 
 
 #### Merge the relevant plot sets:
-## Richter DB
+## Richter DB: prep the right columns in the right format
 richter_premerge = richter_plots %>%
   mutate(survey_year = str_sub(Date,1,4)) %>%
   mutate(fire_sev = recode(FIRE_SEV, "Control" = "0", "Low" = "1", "Med" = "3", "High" = "5", "Unburned" = "0") %>% as.numeric) %>%
   select(FIRE_ID, Plot_ID = `Plot ID`, Sample_Year, Easting, Northing, fire_sev)
 
-# Need to pull in the FRD 2013 surveys coords
+## Need to pull in the FRD 2013 surveys coords, which are missing from the main Richter CSE database
 frd_missing_coords = read_excel(datadir("CSEs/richter-additional/freds/CSE_Missing_Coordinates_CJR.xlsx")) %>%
   rename("Plot_ID" = `Plot ID`, "Easting_missing" = "Easting", "Northing_missing" = "Northing")
 
@@ -52,13 +54,14 @@ richter_premerge_2 =
   mutate(Easting = ifelse(is.na(Easting), Easting_missing, Easting),
          Northing = ifelse(is.na(Northing), Northing_missing, Northing)) %>%
   select(-Easting_missing, -Northing_missing) %>%
-  mutate(CSE = "CSE", revisited = "Not-revisited")
+  mutate(permanent = "Permanent", revisited = "Not-revisited", source = "richter-cse-db")
 
+## Mark the Angora Fire plots as revisited
 richter_premerge_2[richter_premerge_2$FIRE_ID == "ANG", "revisited"] = "Revisited"
 
 
-## Need to pull in the FRD 2012 fire sevs
-# Fix the Frd 2012 plot IDs: FRD_12_395 -> FRD120395
+## Need to pull in the FRD 2012 fire sevs (they are missing from the main Richter CSE database)
+# First fix the Frd 2012 plot ID formatting: FRD_12_395 -> FRD120395
 richter_premerge_2 = richter_premerge_2 %>%
   mutate(Plot_ID = str_replace(Plot_ID,pattern = fixed("FRD_12_"),replacement = "FRD120"))
 
@@ -71,24 +74,42 @@ richter_premerge_3 =
   select(-fire_sev_missing)
 
 
-##Pendola
+##Pendola Fire data from Clark Richter: prep the right columns in the right format
 pendola_premerge = pendola_plots %>%
   mutate(Sample_Year = str_sub(Date,1,4) %>% as.numeric,
          FIRE_ID = str_sub(Regen_Plot,1,3)) %>%
   select(FIRE_ID, Plot_ID = Regen_Plot, Sample_Year, Easting, Northing, fire_sev = FIRE_SEV) %>%
-  mutate(CSE = "CSE", revisited = "Not-revisited")
+  mutate(permanent = "Permanent", revisited = "Not-revisited", source="richter-cse-additional")
 
-###TODO !!!###!!! Filter to just those plots that are in the richter sheets "total Species Composition"
+## Filter to just those Pendola plots that are in the Richter sheets "Species Composition" -- to make sure that we only sample the CSEs since there were also standalone regen-only plots that were not rebarred.
+species_plumas_2010 = read_excel(datadir("CSEs/richter-additional/pendola/Pendola_Species_Composition.xlsx"),sheet="PNF_2010") %>%
+  rename(PlotID = "Plot ID") %>%
+  mutate(PlotID_full = paste0("PNP10",str_pad(PlotID,5,side="left",pad="0")))
+species_plumas_2011 = read_excel(datadir("CSEs/richter-additional/pendola/Pendola_Species_Composition.xlsx"),sheet="PNF_2011") %>%
+  rename(PlotID = "Plot ID") %>%
+  mutate(PlotID_full = paste0("PNP111",str_pad(PlotID,4,side="left",pad="0")))
+species_tahoe_2010 = read_excel(datadir("CSEs/richter-additional/pendola/Pendola_Species_Composition.xlsx"),sheet="TNF_2010") %>%
+  rename(PlotID = "Plot ID") %>%
+  mutate(PlotID_full = paste0("PNT10",str_pad(PlotID,5,side="left",pad="0")))
+species_tahoe_2011 = read_excel(datadir("CSEs/richter-additional/pendola/Pendola_Species_Composition.xlsx"),sheet="TNF_2011") %>%
+  rename(PlotID = "Plot ID") %>%
+  mutate(PlotID_full = paste0("PNT11",str_pad(PlotID,5,side="left",pad="0")))
+pendola_species = bind_rows(species_plumas_2010,
+                            species_plumas_2011,
+                            species_tahoe_2010,
+                            species_tahoe_2011)
+
+pendola_premerge = pendola_premerge %>%
+  filter(Plot_ID %in% pendola_species$PlotID_full)
 
 
-
-# Showers & Gondola
+## Showers & Gondola: prep the right columns in the right format
 gond_show_premerge = gond_show_plots %>%
   mutate(FIRE_ID = str_sub(Regen_Plot_Mast,1,3)) %>%
-  filter(Year <= 2009) %>% # keep only those plots sampled in 08 and 09 (bc DB also includes resampled)
+  filter(Year <= 2009) %>% # keep only those plots sampled in 08 and 09 (bc DB also includes plots resampled at a later date, but don't want those to look like additional plots)
   select(FIRE_ID, Plot_ID = Regen_Plot_Mast, Sample_Year = Year, Easting, Northing, fire_sev = FIRE_SEV)
 
-# Pull in missing plots locs
+## Pull in missing Showers plots locs
 
 show_missing_coords = read_excel(datadir("CSEs/showers-gondola/PlotLocations_Gondola&Showers.xlsx"),sheet=2) %>%
   select(Plot_ID = Object_ID, Northing_missing = Northing, Easting_missing = Easting)
@@ -98,54 +119,46 @@ gond_show_premerge_2 = gond_show_premerge %>%
   mutate(Easting = ifelse(is.na(Easting), Easting_missing, Easting) %>% as.numeric,
          Northing = ifelse(is.na(Northing), Northing_missing, Northing) %>% as.numeric) %>%
   select(-Easting_missing, -Northing_missing) %>%
-  mutate(CSE = "CSE", revisited = "Revisited")
+  mutate(permanent = "Permanent", revisited = "Revisited", source = "safford-gon-show-cse")
 
 
-## Welch-Young (flag that non-CSE)
+## Welch-Young (flag that non-CSE): prep the right columns in the right format
 
 welch_young_premerge = welch_young_plots %>%
   mutate(FIRE_ID = str_sub(Regen_Plot,1,3)) %>%
   select(FIRE_ID,Plot_ID = Regen_Plot, Sample_Year = Year, Easting, Northing, fire_sev = FIRE_SEV, fire_year = Year.of.Fire) %>%
-  mutate(CSE = "Non-CSE", revisited = "Not-revisited")
+  mutate(permanent = "Non-permanent", revisited = "Not-revisited", source = "welch-young-regen")
 
-## Latimer-Young (flag that non-CSE)
+## Latimer-Young (flag that non-CSE): prep the right columns in the right format
 
 jfsp_premerge = jfsp_plots %>%
   mutate(FIRE_ID = str_sub(plot_id,1,1)) %>%
   select(FIRE_ID, Plot_ID = plot_id, Sample_Year = sample_year, longitude, latitude, fire_year) %>%
-  mutate(fire_sev = 5, CSE = "Non-CSE", revisited = "Not-revisited")
+  mutate(fire_sev = 5, permanent = "Non-permanent", revisited = "Not-revisited", source = "latimer-young-jfsp")
 
 
 ## Merge everything that's in UTMs and convert to lat-long
 
 plots_merged_utm = bind_rows(richter_premerge_3, pendola_premerge, gond_show_premerge_2, welch_young_premerge)
+
+#! Some plots have weird coords (all Star fire plots and some Power). These are in lat/long: e.g., 1203931 means 120 deg, 39" 31" W. But the precision is too low (1 second of lat/long = ~30 m)
+# Only keep those plots that have coords that make sense
 plots_merged_utm = plots_merged_utm %>%
   filter(between(Easting,580000,1210000),
-         between(Northing,1e06,10000000)) # this ends up throwing out some PWR 2015 plots with erroneously small NOrthings
+         between(Northing,1e06,10000000)) # this ends up throwing out all STA plots and some PWR 2015 plots
 
-# what is the UTM cutoff bt 10n and 11n?
-hist(plots_merged_utm$Easting)
-# looks like it's 10n > 1000000
-hist(plots_merged_utm$Northing)
+# All these plots appear to be in UTM 10N
+# Make them into a spatial object (points)
+plots_10n_sf = st_as_sf(plots_merged_utm,coords = c("Easting","Northing"), crs = 26910)
 
-plots_merged_10n = plots_merged_utm %>%
-  filter(Easting > 1000000)
-plots_merged_11n = plots_merged_utm %>%
-  filter(Easting < 1000000)
-
-plots_10n_sf = st_as_sf(plots_merged_10n,coords = c("Easting","Northing"), crs = 26911)
-plots_11n_sf = st_as_sf(plots_merged_11n,coords = c("Easting","Northing"), crs = 26910)
-
-# OK all the UTM plots were in 11n
-plots_sf_latlong = st_transform(plots_11n_sf, 4326)
-
+# Project to lat/long and extract coords
+plots_sf_latlong = st_transform(plots_10n_sf, 4326)
 coords = st_coordinates(plots_sf_latlong)
-
 plots_sf_latlong$longitude = coords[,1]
 plots_sf_latlong$latitude = coords[,2]
-
 st_geometry(plots_sf_latlong) = NULL
 
+# Merge these plots with the latimer-young-jfsp plots, which were already in lat/long
 plots = bind_rows(plots_sf_latlong, jfsp_premerge)
 
 # what fire years need to be populated?
@@ -154,17 +167,13 @@ table(plots$FIRE_ID, plots$fire_year)
 ## Populate missing fire years
 plots = plots %>%
   mutate(fire_year_missing = recode(FIRE_ID, ANG = 2007, GON = 2002, MNL = 2007, PNP = 1999, PNT = 1999, SHR = 2002, FRD = 2004, PWR = 2004, RCH = 2008, .default = 0)) %>%
-  mutate(fire_year = ifelse(is.na(fire_year), fire_year_missing, fire_year))
+  mutate(fire_year = ifelse(is.na(fire_year), fire_year_missing, fire_year)) %>%
+  select(-fire_year_missing)
 
 
-### From Richter DB:
+## Remove plots from Richter DB that are not relevant to this project
 # want to keep Angora 2012 survey (it's 5 y old) but !!! DROP 2009 (too young)
-# !!! drop RCH (reburned)
-# keep Freds 2012-2013 (they're 8-9 y post)
-# keep moonlight 2014 (it's 7 y post)
-# keep power 2014-2015 (it's 10-11 y post)
-# keep Star (it's 14 y)
-
+# drop RCH (reburned)
 plots = plots %>%
   filter(!(FIRE_ID == "RCH") & !((FIRE_ID == "ANG") & (Sample_Year == 2009)))
 
@@ -174,18 +183,18 @@ plots = plots %>%
   filter(fire_sev >= 3)
   
 
-### Filter out burned plots
+#### Filter out plots that burned after the survey
+
+# Load fire permi database. It only goes through 2020
 fire_perims = vect(datadir("/fire-perims/fire20_1.gdb"))
 fire_perims = fire_perims[fire_perims$YEAR_ > 1994,]
 fire_perims$YEAR_ = as.numeric(fire_perims$YEAR_)
 
-
-# rasterize it
+# Rasterize it for easy extraction. When two fires overlap, keep the year of the most recent
 r = rast(fire_perims,resolution=50,crs="+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs ")
 mostrecent_fire = rasterize(fire_perims,r, field="YEAR_", fun=max)
 
-
-
+## Bring in the important 2021 fires (Caldor and Dixie), rasterize them too
 caldor = vect(datadir("fire-perims/ca3858612053820210815_20201011_20211016_ravg_data/ca3858612053820210815_20201011_20211016/CA3858612053820210815.kml"))
 caldor = project(caldor,r)
 caldor$year = 2021
@@ -195,39 +204,121 @@ dixie = project(dixie,r)
 dixie$year = 2021
 dixie_rast = rasterize(dixie,r,field="year", fun=max)
 
+## Stack the fires and get the most recent year of fire for each pixel, accounting for 2021 fires too
 fire_hist = c(mostrecent_fire,caldor_rast,dixie_rast)
 fire_hist = max(fire_hist, na.rm=TRUE)
 
-writeRaster(fire_hist,datadir("temp/mostrecent_fire.tif"), overwrite=TRUE)
+# temp export for checking
+# writeRaster(fire_hist,datadir("temp/mostrecent_fire.tif"), overwrite=TRUE)
 
-fire_hist = max(mostrecent_fire,caldor,dixie)
-
-## extract most recent fire at each plot
+## Extract the year of most recent fire at each plot
 plots_sf = st_as_sf(plots,coords = c("longitude","latitude"), crs = 4326) %>% st_transform(3310)
 plots_vect = vect(plots_sf)
-
 mostrecent_fire = extract(fire_hist,plots_vect)
 plots_sf$mostrecent_fire = mostrecent_fire[,2]
 
 
-# did the plot burn since focal fire?
+# Did the plot burn since focal fire?
 plots_sf$reburned = plots_sf$fire_year < plots_sf$mostrecent_fire
 
-##!! exclude 234 reburned plots
+##!! Exclude 234 reburned plots
 plots_sf = plots_sf %>%
   filter(reburned == FALSE)
 
 
-st_write(plots_sf,datadir("temp/plots.gpkg"))
+# temp export for checking
+# st_write(plots_sf,datadir("temp/plots.gpkg"), delete_dsn=TRUE)
 
 
 
+#### Remove plots that are managed after the fire year
 
+## Load FACTS (USFS forest management database)
+facts = st_read(datadir("facts/compiled/facts_merged.gpkg"))
 
+## Check for reporting discrepancies in reported size vs. actual size
+# remove those units where reported and GIS acres do not match. Check either NBR_UNTIS or SUBUNIT_S and allow either to match
+# making sure GIS acres is not much larger than reported acres
+# Doing this because have found that some units cover far more area spatially than were really reported to be treated
+facts <- facts %>%
+  mutate( reporting_discrepancy = ! (((((NBR_UNITS_ > (GIS_ACRES*.75)) ) | ((NBR_UNITS_ > (GIS_ACRES - 25)) ))) |
+                                       ((((SUBUNIT_SI > (GIS_ACRES*.75)) ) | ((SUBUNIT_SI > (GIS_ACRES - 25)) )))) )
 
+# If completed date is blank, use awarded date. otherwise keep completed date as it was.
+facts$DATE_COMPOSITE <- ifelse(is.na(facts$DATE_COMPL),facts$DATE_AWARD %>% as.character,facts$DATE_COMPL %>% as.character)
+facts$year <- as.numeric(substr(facts$DATE_COMPOSITE,1,4))
+# Remove management that was not actually performed (e.g., just planned)
+facts <- facts[!is.na(facts$year),]
 
+# Drop units managed before any of the focal fires (to make the dataset smaller and easier to work with)
+facts <- facts[facts$year >= min(plots_sf$fire_year %>% as.numeric),]
+
+# Defin the different management types that we care about
+planting <- c("Plant Trees")
+salvage <- c("Stand Clearcut (w/ leave trees) (EA/RH/FH)", "Salvage Cut (intermediate treatment, not regeneration)","Stand Clearcut (EA/RH/FH)","Patch Clearcut (EA/RH/FH)","Overstory Removal Cut (from advanced regeneration) (EA/RH/FH)","Sanitation Cut","Group Selection Cut (UA/RH/FH)","Overstory Removal Cut (from advanced regeneration) (EA/RH/FH)","Seed-tree Seed Cut (with and without leave trees) (EA/RH/NFH)","Shelterwood Removal Cut (EA/NRH/FH)", "Shelterwood Preparatory Cut (EA/NRH/NFH)", "Improvement Cut", "Shelterwood Establishment Cut (with or without leave trees) (EA/RH/NFH)", "Seed-tree Final Cut (EA/NRH/FH)")
+prep <- c("Piling of Fuels, Hand or Machine","Burning of Piled Material","Yarding - Removal of Fuels by Carrying or Dragging","Site Preparation for Planting - Mechanical","Site Preparation for Planting - Manual","Site Preparation for Planting - Burning","Site Preparation for Planting - Other","Site Preparation for Natural Regeneration - Manual","Site Preparation for Natural Regeneration - Burning","Rearrangement of Fuels","Chipping of Fuels","Compacting/Crushing of Fuels", "Slashing - Pre-Site Preparation")
+release <- c("Tree Release and Weed","Control of Understory Vegetation")
+thin <- c("Precommercial Thin","Commercial Thin","Thinning for Hazardous Fuels Reduction","Single-tree Selection Cut (UA/RH/FH)")
+replant <- c("Fill-in or Replant Trees")
+prune <- c("Pruning to Raise Canopy Height and Discourage Crown Fire","Prune")
+fuel <- c("Piling of Fuels, Hand or Machine","Burning of Piled Material","Yarding - Removal of Fuels by Carrying or Dragging","Rearrangement of Fuels","Chipping of Fuels","Compacting/Crushing of Fuels","Underburn - Low Intensity (Majority of Unit)","Broadcast Burning - Covers a majority of the unit")
+
+manage <- c(planting,salvage,prep,release,thin,replant,prune,fuel)
+
+# Filter to only the management types we care about
+facts = facts %>%
+  filter(ACTIVITY %in% manage)
+
+# Extract FACTS history at each plot (this is just a matrix the lists the indices of each FACTS polygon that intersects each plot. Need to futher process it in the lines below to get the actual managmenet history)
+activities = st_intersects(plots_sf %>% st_transform(st_crs(facts)),facts)
+
+# Initiate new columns to store FACTS management history data
+plots_sf$facts_managed = NA
+plots_sf$facts_year_mostrecent = NA
+plots_sf$facts_activity = NA
+plots_sf$facts_date_award = NA
+plots_sf$facts_date_compl = NA
+plots_sf$facts_reporting_discrepancy = NA
+
+# For each plot, get the activities that happened after the fire year
+for(i in 1:nrow(plots_sf)) {
   
-## Extract climate data
+  plot = plots_sf[i,]
+  
+  # which facts polygons overlapped the plot
+  facts_indices = activities[[i]]
+  facts_overlap = facts[facts_indices,]
+  
+  # get the most recent year of management out of all the facts polygons that overlapped
+  facts_year_mostrecent = max(facts_overlap$year)
+  facts_year_mostrecent = ifelse(facts_year_mostrecent == -Inf, NA, facts_year_mostrecent)
+  
+  # if the most recent year of management was before the fire, ignore the management records
+  if(is.na(facts_year_mostrecent) | (facts_year_mostrecent < plot$fire_year)) next()
+  
+  # otherwise, record all the management that happened there
+  plots_sf[i,which(names(plots_sf) == "facts_managed")] = TRUE
+  plots_sf[i,which(names(plots_sf) == "facts_year")] = paste(facts_overlap$year,collapse=", ")
+  plots_sf[i,which(names(plots_sf) == "facts_year_mostrecent")] = facts_year_mostrecent
+  plots_sf[i,which(names(plots_sf) == "facts_activity")] = paste(facts_overlap$ACTIVITY,collapse=", ")
+  plots_sf[i,which(names(plots_sf) == "facts_date_award")] = paste(facts_overlap$DATE_AWARD,collapse=", ")
+  plots_sf[i,which(names(plots_sf) == "facts_date_compl")] = paste(facts_overlap$DATE_COMPL,collapse=", ")
+  plots_sf[i,which(names(plots_sf) == "facts_reporting_discrepancy")] = paste(facts_overlap$reporting_discrepancy,collapse=", ")
+  
+}
+
+
+### Make sure plots are on FS land
+sf_use_s2(FALSE)
+fsland = st_read(datadir("ownership/fsland_ca.gpkg")) %>% st_buffer(0) %>% st_union
+on_fs = st_intersects(plots_sf %>% st_transform(st_crs(fsland)),fsland, sparse=FALSE)
+plots_sf$fs_land = on_fs[,1]
+
+plots_sf = plots_sf %>%
+  filter(fs_land == TRUE | FIRE_ID == "GON") # make a temporary exception for the Gondola fire because it's just over the border in NV and our FS ownership and FACTS layer doesn't yet extend there. Assume it wasn't managed and it's on FS land.
+
+
+### Extract climate data at plot locations
 precip = rast(datadir("prism/PRISM_ppt_30yr_normal_800mM3_annual_bil/PRISM_ppt_30yr_normal_800mM3_annual_bil.bil"))
 tmean = rast(datadir("prism/PRISM_tmean_30yr_normal_800mM3_annual_bil/PRISM_tmean_30yr_normal_800mM3_annual_bil.bil"))
 
@@ -242,54 +333,41 @@ plots_sf$tmean = tmean_extr[,2]
 
 
 ### Compute # years since fire and since first survey
-
 plots_sf = plots_sf %>%
   mutate(yrs_to_first_survey = Sample_Year - fire_year,
          yrs_since_first_survey = 2022 - Sample_Year)
 
+
+### Change the FACTS managed column to have descriptive values
+plots_sf = plots_sf %>%
+  mutate(facts_managed = ifelse(!is.na(facts_managed), "Managed", "Unmanaged"))
+
+
+### Save compiled plot data (spatial), plus separate shapefiles for permanently marked and non-permanently marked plots
+
+# Remove unneeded and potentially confusing columns
+plots_sf = plots_sf %>%
+  select(-mostrecent_fire, -facts_reporting_discrepancy, -fs_land)
+
+plots_permanent = plots_sf %>%
+  filter(permanent == "Permanent")
+
+plots_nonpermanent = plots_sf %>%
+  filter(permanent == "Non-permanent")
+
+st_write(plots_permanent, datadir("plot-data-compiled/plots_compiled_permanent.gpkg"), delete_dsn = TRUE)
+st_write(plots_nonpermanent, datadir("plot-data-compiled/plots_compiled_nonpermanent.gpkg"), delete_dsn = TRUE)
+st_write(plots_sf, datadir("plot-data-compiled/plots_compiled.gpkg"), delete_dsn = TRUE)
+
+
+
+## Prelim visualization
 ggplot(plots_sf, aes(x=precip,y=tmean,color=yrs_to_first_survey)) +
   geom_point() +
-  facet_grid(CSE~revisited) +
+  facet_grid(permanent~facts_managed) +
   theme_bw(15)
 
 ggplot(plots_sf, aes(x=precip,y=tmean,color=yrs_since_first_survey)) +
   geom_point() +
-  facet_grid(CSE~revisited) +
   theme_bw(15)
-
-
-# save separate CSE and non-CSE
-
-plots_cse = plots_sf %>%
-  filter(revisited == "Not-revisited",
-         CSE == "CSE")
-
-plots_noncse = plots_sf %>%
-  filter(revisited == "Not-revisited",
-         CSE == "Non-CSE")
-
-st_write(plots_cse, datadir("temp/plots_cse.gpkg"))
-st_write(plots_noncse, datadir("temp/plots_noncse.gpkg"))
-
-## Remove those that are managed after the fire year
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-table(db_plots$FIRE_ID,db_plots$Sample_Year)
-
-## See which ones have regen data
-
-
 
