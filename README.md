@@ -15,3 +15,5 @@ returns
 `"/Users/derek/Documents/repo_data_local/regen-revisits_data/CSEs/richter-db-export/Plot Data.xlsx"`
 
 This way, you don't need to hard-code the data directory location anywhere except in `data_dir.txt`, and other users only have to modify `data_dir.txt` on their machine in order to point to the location of the data directory on their machine.
+
+To work with this data directory on your local machine, you can either download it from Box manually, or use Box Drive to have the folder sync to your computer. The latter approach is recommended so that you automatically get any changes that others make to the data files, and so that your changes automatically update on Box for everyone else who is working with the data.
