@@ -1,6 +1,6 @@
 # regen-revisits
 
-## Data management for this repo
+## Data management approach for this repo
 
 This repository contains only code files and supporting files. It does not contain data. The data folder for this repository is located on Box: https://ucdavis.box.com/s/9ja36l3be9v9izimibdq9bd6x4rqsd6v
 
