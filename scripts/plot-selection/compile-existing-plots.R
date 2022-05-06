@@ -1,5 +1,7 @@
 #### Purpose: Compile existing plot data from multiple data sources; extract data for evaluating plots such as management history, disturbance history.
 
+
+library(plyr)
 library(tidyverse)
 library(here)
 library(sf)
@@ -19,6 +21,27 @@ source(here("scripts/convenience_functions.R"))
 ##Main CSE database compiled by Clark Richter
 richter_plots = read_excel(datadir("CSEs/richter-db-export/Plot Data.xlsx"))
 
+#add additional powers plots with UTMs instead of Lat Long coords
+power_plots = read_excel(datadir("CSEs/richter-additional/power/Plot Data Total.xlsx"))
+
+#change plot ID to match other PWR plots
+power_plots_cor = power_plots %>%
+  #to match the plot ID from PWR tables to the Plot_ID column from the compiled regen data, prefix them with PWR1400[…]. You need to pad the number of zeros so there are 7 digits total. 
+  #If the plot number has a suffix letter like A or B, this does not count in the 7 digits.
+  mutate(PWR = "PWR14") %>% #add column with prefix for merging
+  separate(`Plot ID`, c("Plot_IDnum","Plot_IDletter"), "(?<=[0-9])(?=[A-Z])") %>% #separate letters from numbers
+  mutate(Plot_IDletter = replace_na(Plot_IDletter, "")) %>% #replace NAs with blanks
+  mutate(Plot_IDpad = str_pad(Plot_IDnum, 5, side = 'left', pad = '0')) %>% #pad with 0s to 5 digits
+  unite("Plot ID", c("PWR", "Plot_IDpad", "Plot_IDletter"), remove = TRUE, sep = "") %>%
+  mutate(FIRE_ID = "PWR") %>%
+  subset(Sample_Year == 2015) %>%
+  select(-(c(Plot_IDnum)))
+
+#replace PWR lat-long values in richter_plots with UTM values from power_plots (power plots sampled in 2015)
+richter_plots_cor = richter_plots %>%
+  filter(!(FIRE_ID == "PWR" & Sample_Year == 2015)) %>%
+  rbind.fill(., power_plots_cor)
+
 
 #TODO: To get Bassetts data: use CSE plot list from Richter tables, merged with ?? for plot locs (originally thought welch DB but those seem to be different plots--waiting for Kevin to respond on this.)
 
@@ -36,11 +59,13 @@ welch_young_plots = read_csv(datadir("non-CSEs/young-welch-summarized/plot_level
 ## Young/Latimer JFSP data
 jfsp_plots = read_excel(datadir("non-CSEs/latimer-young-summarized/Data_template_DJNY-3.xlsx"),sheet = 3)
 
+## Cleveland CSE data
+clev_plots = read_excel(datadir("CSEs/Cleveland/ClevelandFire_NoTreatment.xlsx"),sheet = "Plot_Data")
 
 
 #### Merge the relevant plot sets:
 ## Richter DB: prep the right columns in the right format
-richter_premerge = richter_plots %>%
+richter_premerge = richter_plots_cor %>%
   mutate(survey_year = str_sub(Date,1,4)) %>%
   mutate(fire_sev = recode(FIRE_SEV, "Control" = "0", "Low" = "1", "Med" = "3", "High" = "5", "Unburned" = "0") %>% as.numeric) %>%
   select(FIRE_ID, Plot_ID = `Plot ID`, Sample_Year, Easting, Northing, fire_sev)
@@ -136,16 +161,26 @@ jfsp_premerge = jfsp_plots %>%
   select(FIRE_ID, Plot_ID = plot_id, Sample_Year = sample_year, longitude, latitude, fire_year) %>%
   mutate(fire_sev = 5, permanent = "Non-permanent", revisited = "Not-revisited", source = "latimer-young-jfsp")
 
+## Cleveland plots - clean up for merging - change col names
+clev_premerge = clev_plots %>%
+  mutate(FIRE_ID = "CLV", Plot_ID = `Plot #`, Sample_Year = 2013, 
+         Easting = UTM_Easting, Northing = UTM_Northing, fire_sev = BurnSeverity,
+         permanent = "Permanent", revisited = "Not-revisited", 
+         source = "Gabrielle N. Bohlman", fire_year = 1992) %>%
+  mutate(Plot_ID = as.character(Plot_ID)) %>%
+  select(FIRE_ID, Plot_ID, Sample_Year, Easting, Northing, fire_sev, 
+      permanent, revisited, source, fire_year)  
+
 
 ## Merge everything that's in UTMs and convert to lat-long
 
-plots_merged_utm = bind_rows(richter_premerge_3, pendola_premerge, gond_show_premerge_2, welch_young_premerge)
+plots_merged_utm = bind_rows(richter_premerge_3, pendola_premerge, gond_show_premerge_2, welch_young_premerge, clev_premerge)
 
 #! Some plots have weird coords (all Star fire plots and some Power). These are in lat/long: e.g., 1203931 means 120 deg, 39" 31" W. But the precision is too low (1 second of lat/long = ~30 m)
 # Only keep those plots that have coords that make sense
 plots_merged_utm = plots_merged_utm %>%
   filter(between(Easting,580000,1210000),
-         between(Northing,1e06,10000000)) # this ends up throwing out all STA plots and some PWR 2015 plots
+         between(Northing,1e06,10000000)) # this ends up throwing out all STA plots
 
 # All these plots appear to be in UTM 10N
 # Make them into a spatial object (points)
@@ -175,7 +210,7 @@ plots = plots %>%
 # want to keep Angora 2012 survey (it's 5 y old) but !!! DROP 2009 (too young)
 # drop RCH (reburned)
 plots = plots %>%
-  filter(!(FIRE_ID == "RCH") & !((FIRE_ID == "ANG") & (Sample_Year == 2009)))
+  filter(!(FIRE_ID == "RCH") )
 
 
 ### Filter to moderate-high sev
@@ -187,12 +222,13 @@ plots = plots %>%
 
 # Load fire permi database. It only goes through 2020
 fire_perims = vect(datadir("/fire-perims/fire20_1.gdb"))
-fire_perims = fire_perims[fire_perims$YEAR_ > 1994,]
 fire_perims$YEAR_ = as.numeric(fire_perims$YEAR_)
+fire_perims = fire_perims[fire_perims$YEAR_ > 1991,]
 
 # Rasterize it for easy extraction. When two fires overlap, keep the year of the most recent
 r = rast(fire_perims,resolution=50,crs="+proj=aea +lat_1=34 +lat_2=40.5 +lat_0=0 +lon_0=-120 +x_0=0 +y_0=-4000000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs ")
 mostrecent_fire = rasterize(fire_perims,r, field="YEAR_", fun=max)
+
 
 ## Bring in the important 2021 fires (Caldor and Dixie), rasterize them too
 caldor = vect(datadir("fire-perims/ca3858612053820210815_20201011_20211016_ravg_data/ca3858612053820210815_20201011_20211016/CA3858612053820210815.kml"))
@@ -217,14 +253,20 @@ plots_vect = vect(plots_sf)
 mostrecent_fire = extract(fire_hist,plots_vect)
 plots_sf$mostrecent_fire = mostrecent_fire[,2]
 
-
 # Did the plot burn since focal fire?
-plots_sf$reburned = plots_sf$fire_year < plots_sf$mostrecent_fire
+plots_sf$reburned = plots_sf$fire_year < plots_sf$mostrecent_fire ## new coordinates for PWR do not fall within the PWR burn perim? mostrecent_fire = NaN
+
+#plot pwr and utms to check locations
+
+# plot(plots_sf[190:199,1], col = 'red')
+# plot(fire_perims[fire_perims$FIRE_NAME == 'POWER' & fire_perims$YEAR_ == 2004,], add = TRUE)
+
+
+
 
 ##!! Exclude 234 reburned plots
 plots_sf = plots_sf %>%
   filter(reburned == FALSE)
-
 
 # temp export for checking
 # st_write(plots_sf,datadir("temp/plots.gpkg"), delete_dsn=TRUE)
@@ -331,7 +373,6 @@ plots_sf$precip = precip_extr[,2]
 plots_sf$tmean = tmean_extr[,2]
 
 
-
 ### Compute # years since fire and since first survey
 plots_sf = plots_sf %>%
   mutate(yrs_to_first_survey = Sample_Year - fire_year,
@@ -343,7 +384,9 @@ plots_sf = plots_sf %>%
   mutate(facts_managed = ifelse(!is.na(facts_managed), "Managed", "Unmanaged"))
 
 
-### Save compiled plot data (spatial), plus separate shapefiles for permanently marked and non-permanently marked plots
+
+### Save compiled plot data (spatial), ------------ 
+#plus separate shapefiles for permanently marked and non-permanently marked plots
 
 # Remove unneeded and potentially confusing columns
 plots_sf = plots_sf %>%
@@ -355,14 +398,29 @@ plots_permanent = plots_sf %>%
 plots_nonpermanent = plots_sf %>%
   filter(permanent == "Non-permanent")
 
+plots_permanent_unmanged = plots_permanent %>% filter(facts_managed == "Unmanaged")
+
+plots_permanent_unmanged %>%
+  group_by(FIRE_ID) %>% count()
+
+## correct fire IDs
+plots_sf_cor = plots_sf %>% 
+  mutate(FIRE_ID_cor = FIRE_ID) %>%
+  mutate(FIRE_ID = replace(FIRE_ID, FIRE_ID == "MOO", "MNL")) %>%
+  mutate(FIRE_ID_cor = replace(FIRE_ID_cor, FIRE_ID_cor == "A", "MNL")) %>%
+  mutate(FIRE_ID_cor = replace(FIRE_ID_cor, FIRE_ID_cor == "B", "PWR")) %>%
+  mutate(FIRE_ID_cor = replace(FIRE_ID_cor, FIRE_ID_cor == "C", "AMR")) %>%
+  mutate(FIRE_ID_cor = replace(FIRE_ID_cor, FIRE_ID_cor == "PNP", "PNT"))
+
+
 st_write(plots_permanent, datadir("plot-data-compiled/plots_compiled_permanent.gpkg"), delete_dsn = TRUE)
 st_write(plots_nonpermanent, datadir("plot-data-compiled/plots_compiled_nonpermanent.gpkg"), delete_dsn = TRUE)
 st_write(plots_sf, datadir("plot-data-compiled/plots_compiled.gpkg"), delete_dsn = TRUE)
-
+st_write(plots_permanent_unmanged, datadir("plot-data-compiled/plots_permanent_unmanged.gpkg"), delete_dsn = TRUE)
 
 
 ## Prelim visualization
-ggplot(plots_sf, aes(x=precip,y=tmean,color=yrs_to_first_survey)) +
+ggplot(plots_sf_cor, aes(x=precip,y=tmean,color=FIRE_ID_cor)) +
   geom_point() +
   facet_grid(permanent~facts_managed) +
   theme_bw(15)
