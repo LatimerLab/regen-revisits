@@ -1,0 +1,928 @@
+---
+title: "regen_revisits_analysis"
+author: "CT"
+date: "2023-06-29"
+output: html_document
+---
+
+This script analyses post-fire revisited plot data from 7 fires in northern California to investigate trends in conifer seedling density and vegetation structure over time.
+
+Analyses include: (a) modeling revisit density of conifer seedlings by genera, (b) visualizing establishment of seedlings by time since fire and year,  modeling change in density over time of (c) conifer seedlings and (d) vegetation components (grass, shrubs, forbs, and dominant shrub species)
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(here)
+library(lme4)
+library(MASS)
+library(performance) #for checking overdispersion
+library(sjPlot)
+library(sjmisc)
+library(sjlabelled)
+library(glmmTMB)
+library(DHARMa)
+library(emmeans)
+library(patchwork)
+library(viridis)
+library(reshape2) 
+library(reshape) 
+library(GGally)
+data_dir = readLines(here("data_dir.txt"), n=1)
+source(here("scripts/convenience_functions.R"))
+```
+
+Load and clean revisited plot data
+```{r}
+load = read_csv(datadir("final_data/final_data_for_revisit_conifer_anlyses.csv"))
+
+#combine hardwoods and shrub cover
+df = load %>% mutate(Shrubs = coalesce(Shrubs, 0),
+                     HARDWOOD = coalesce(HARDWOOD, 0),
+                     Shrubs = Shrubs + HARDWOOD,
+                     #replace NA and Inf distance to seed source with large number
+                      DistPre = coalesce(DistPre, 400))
+
+#replace DistPre inf with 400 
+df$DistPre[is.infinite(df$DistPre)] <- 400
+
+## add column for yes/no more seedlings at revisit and yes/no fewer seedlings at revisit
+df = df %>% mutate(net_recruit_TF = factor(seedling_count_revisit > seedling_count_initial),
+                   net_mort_TF = factor(seedling_count_revisit < seedling_count_initial))
+
+
+
+#remove ANG - something strange with the plot codes -,  CLV - too long after fire and hardly any seedlings, and AMR - outlier fire with only one plot
+df2 = df %>%
+  filter(Fire != "Angora" & Fire != "CLV" & Fire != "American River Complex")
+  
+#clean up columns 
+df_clean = df2 %>% 
+  mutate(yrs2revisit = sample_yr_revisit - fire_year,
+         seedling_count_initial_sqrt = sqrt(seedling_count_initial),
+         stocked_initial = case_when(seedling_count_initial > 0 ~ 1,
+                                     seedling_count_initial <= 0 ~ 0),
+         stocked_revisit = case_when(seedling_count_revisit > 0 ~ 1,
+                                     seedling_count_revisit <= 0 ~ 0),
+         gained_stocking = case_when(stocked_initial == 0 & 
+                                       stocked_revisit == 1 ~ 1,
+                                     .default = 0),
+         lost_stocking = case_when(stocked_initial == 1 & 
+                                       stocked_revisit == 0 ~ 1,
+                                     .default = 0),
+         #change shrub cover so that it cannot exceed 100%
+         Shrubs = case_when(Shrubs > 100 ~ 100, TRUE ~ Shrubs),
+         #convert counts to density
+         initial_density = seedling_count_initial/60,
+         revisit_density = seedling_count_revisit/60,
+         initial_density_scale_sqrt = sqrt(initial_density),
+         #add vars for scaling in the next step
+         yrs2initial_scale = yrs2initial,
+         Shrubs_scale = Shrubs,
+         time_between_samples_scale = time_between_samples,
+         seedling_count_initial_scale = seedling_count_initial_sqrt,
+         DistPre_scale = DistPre,
+         heat_load_scale = heat_load,
+         )
+
+#write_csv(df_clean, datadir("revisit_analysis_cleaned_data/cleaned_data_from_analysis.csv"))
+
+```
+
+
+Explore data summaries
+```{r}
+#summarise data
+sum_table = df_clean %>% group_by(Fire, sp_func) %>%
+  summarise(seedling_count_initial = length(Plot_ID[seedling_count_initial > 0]),
+            seed_source50 = length(Plot_ID[DistPre <= 50]))
+
+sum_table2 = df_clean %>% group_by(Plot_ID) %>%
+  summarise(seedling_count_initial = sum(seedling_count_initial),
+            seedling_count_revisit = sum(seedling_count_revisit))
+
+
+plots_per_fire = df_clean %>% filter(sp_func == "pine") %>%
+  group_by(Fire) %>%
+  summarise(n = n())
+
+#79 plots
+fire_table = df_clean %>% dplyr::select(Fire, fire_year,  initial_sample_yr, yrs2initial, sample_yr_revisit, time_between_samples) %>%
+  distinct() %>%
+  mutate(total_time = sample_yr_revisit - fire_year)
+
+
+#summarise elev data
+elev_sum = df_clean %>% filter(sp_func == "pine") %>%
+  group_by(Fire) %>%
+  summarise(max = max(elev),
+            min = min(elev),
+            mean = mean(elev))
+
+```
+
+
+Explore data correlations
+
+>tmean and temp highly correlated ~.5
+>very zero inflated? Check for overdispersion after fitting the model
+
+```{r}
+ggplot(df_clean, aes(seedling_count_revisit, fill = sp_func)) + geom_histogram(binwidth = 1) + facet_grid(sp_func ~ 
+    ., margins = TRUE, scales = "free")
+
+ggplot(df_clean %>% filter(sp_func == "pine"), aes(yrs2initial, fill = Fire)) + geom_histogram(binwidth = 1)+theme_bw(13)
+
+ggplot(df_clean %>% filter(sp_func == "pine"), aes(time_between_samples, fill = Fire)) + geom_histogram(binwidth = 1)+theme_bw(13)
+
+
+```
+
+
+
+```{r}
+ggpairs(df_scaled[, c("seedling_count_initial", "seedling_count_revisit", "DistPre", "yrs2initial", "time_between_samples", "Shrubs", "precip", "tmean", "twi", "heat_load", 'seedling_count_initial_sqrt')], progress = FALSE)
+```
+
+> Precip and temp are highly correlated
+
+
+#scale data for revisit analysis
+```{r}
+df_scaled = df_clean %>% mutate_at(c('DistPre_scale', 'Shrubs_scale', 'heat_load_scale','seedling_count_initial_scale', 'yrs2initial_scale', 'time_between_samples_scale'), ~(scale(.) %>% as.vector))
+
+#separate SIM from other Sierra fires for modeling
+df_scaled_nosim = df_scaled %>% filter(Fire != "SIM")
+df_scaled_sim = df_scaled %>% filter(Fire == "SIM") #separate SIM because it's the only fire with substantial PSME and not much else.
+
+#create df with all species lumped
+lumped_df = df_clean %>% group_by(Plot_ID, Fire, heat_load, Shrubs,  time_between_samples, yrs2initial) %>% 
+  summarise(DistPre = min(DistPre),
+            seedling_count_initial = sum(seedling_count_initial, na.rm = TRUE),
+            seedling_count_initial_sqrt = sqrt(sum(seedling_count_initial, na.rm = TRUE)),
+            seedling_count_revisit = sum(seedling_count_revisit, na.rm = TRUE),
+            net_seedling_dif = seedling_count_revisit - seedling_count_initial)
+
+
+#scale lumped df
+lumped_df_scale = lumped_df %>% data.frame() %>% mutate_at(c('DistPre', 'Shrubs', 'heat_load',  'seedling_count_initial_sqrt', 'yrs2initial', 'time_between_samples'), ~(scale(.) %>% as.vector))
+```
+
+# Explore covariate relationships with seedling density
+```{r}
+
+tmp <- reshape2::melt(df_clean[, c("net_recruit_TF", "seedling_count_initial", "DistPre", "time_between_samples", "Shrubs")],
+  id ="net_recruit_TF")
+
+tmp <- reshape2::melt(df_clean[, c("net_recruit_TF", "seedling_count_initial", "DistPre", "time_between_samples", "Shrubs")],
+  id ="net_recruit_TF")
+
+tmp2 <- reshape2::melt(df_clean[, c("net_mort_TF", "seedling_count_initial", "DistPre", "time_between_samples", "Shrubs")],
+  id ="net_mort_TF")
+
+
+
+ggplot(tmp, aes(net_recruit_TF, y = value, fill=net_recruit_TF)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free_y")
+
+ggplot(tmp2, aes(net_mort_TF, y = value, fill=net_mort_TF)) +
+  geom_boxplot() +
+  facet_wrap(~variable, scales="free_y")
+
+
+```
+
+Plot relationsips between initial and revisit seedlings with 1:1 lines
+```{r} 
+pal =  c(
+  "#00798c",
+  "#d1495b",
+  "#edae49",
+  "#66a182",
+  "#2e4057",
+  "#8d96a3",
+  "#6F4685"
+)
+
+
+
+(p_all = ggplot(df_scaled %>% filter(sp_func == "fir" | sp_func == "Douglas-fir" | sp_func == "pine") %>%
+                  mutate(Fire = case_when(Fire == "GON" ~ "Gondola", Fire == "MNL" ~ "Moonlight", Fire == "SHR" ~ "Showers", Fire == "SIM" ~ "Sims", TRUE ~ Fire)), 
+  aes(x = sqrt(seedling_count_initial/60), y = sqrt(seedling_count_revisit/60), color = Fire))+
+  geom_point(size = 2.8, alpha = 0.8) +
+  theme_bw(13)+
+  geom_abline(slope = 1)+
+        scale_color_manual(values = pal)+
+    # geom_smooth(method = "lm")+
+  xlab(bquote(`initial seedlings m`^`-2`))+
+  ylab(bquote(`re-survey seedlings m`^`-2`))+
+  scale_y_continuous(labels = function(x) x^2, breaks = c(0, 0.5, sqrt(.75), sqrt(1.5)))+
+  scale_x_continuous(labels = function(x) x^2, breaks = c(0, 0.5, sqrt(.75), sqrt(1.5)))+
+  facet_grid(~sp_func))
+
+
+
+# ggsave(datadir("figures/raw_counts_cse_all_fires.png"), width = 9, height = 3.5)
+```
+
+
+
+# Data Analysis
+
+
+## (a) Model revisit seedling density as a function of initial seedling density and covariates
+
+
+Pine revisits model
+```{r}
+
+m_pine = glmmTMB(seedling_count_revisit ~ seedling_count_initial_scale + Shrubs_scale + heat_load_scale + DistPre_scale + yrs2initial_scale + time_between_samples_scale, data = df_scaled_nosim %>% filter(sp_func == "pine"), family = nbinom2)
+
+
+#check model assumptions
+check_overdispersion(m_pine)
+simoutput = simulateResiduals(m_pine, re.form = NULL)
+testDispersion(simoutput)
+
+#create pine only df for plotting
+df_pine = df_scaled_nosim %>% filter(sp_func == "pine")
+plotResiduals(m_pine, form = df_pine$seedling_count_initial_scale)
+
+summary(m_pine)
+
+
+#modele seedling count revisit without seedling count initial to compute partial r2
+m_pine_ns = glmmTMB(seedling_count_revisit ~  Shrubs_scale + heat_load_scale + DistPre_scale + yrs2initial_scale + time_between_samples_scale, data = df_scaled_nosim %>% filter(sp_func == "pine"), family = nbinom2)
+
+```
+
+Fir revisits model
+```{r}
+m_fir = glmmTMB(seedling_count_revisit ~ seedling_count_initial_scale + Shrubs_scale + heat_load_scale + DistPre_scale + yrs2initial_scale + time_between_samples_scale, data = df_scaled_nosim %>% filter(sp_func == "fir"), family = nbinom2)
+
+#test assumptions
+simoutput = simulateResiduals(m_fir, re.form = NULL)
+testDispersion(simoutput)
+df_fir = df_scaled_nosim %>% filter(sp_func == "fir")
+plotResiduals(m_fir, form = df_fir$seedling_count_initial_scale)
+plotResiduals(m_fir)
+
+summary(m_fir)
+
+#model without initial seedling count to compute r2
+m_fir_ns = glmmTMB(seedling_count_revisit ~ Shrubs_scale + heat_load_scale + DistPre_scale + yrs2initial_scale + time_between_samples_scale, data = df_scaled_nosim %>% filter(sp_func == "fir"), family = nbinom2)
+```
+
+Douglas-fir revisits model - only data from SIMs fire
+```{r}
+m_sim = glmmTMB(seedling_count_revisit ~ seedling_count_initial_scale  + Shrubs_scale  + heat_load_scale  + DistPre_scale , data = df_scaled_sim %>% filter(sp_func == "Douglas-fir"), family = nbinom2)
+
+#test assumptions
+simoutput = simulateResiduals(m_sim, re.form = NULL)
+testDispersion(simoutput)
+df_fir_sim = df_scaled_sim %>% filter(sp_func == "Douglas-fir")
+plotResiduals(m_sim, form = df_fir_sim$seedling_count_initial_scale)
+plotResiduals(m_sim) 
+summary(m_sim)
+
+# without initial seedlings
+m_sim_ns = glmmTMB(seedling_count_revisit ~ Shrubs_scale  + heat_load_scale  + DistPre_scale, data = df_scaled_sim %>% filter(sp_func == "Douglas-fir"), family = nbinom2)
+
+#compute r2
+r2_nakagawa(m_sim)
+r2_nakagawa(m_fir)
+r2_nakagawa(m_pine)
+```
+
+make plots for revisit density models 
+```{r}
+pal = c("#07393C", "#2C666E", "#A4AC96")
+pal2 = c("#2C666E", "#A4AC96")
+
+(p1 = plot_models(m_pine, m_fir, m_sim,
+            axis.labels = rev(c('initial seedling count',
+                            'shrub cover', 
+                            'heat load',
+                            'dist. to seed source',
+                            'time to initial sample',
+                            'time between samples'
+                            )),
+            m.labels = c("pine", "fir", "Douglas-fir"),
+            axis.lim = c(0.1,10),
+            legend.title = "",
+            colors = pal) + 
+  theme_bw(14)+
+  geom_hline(yintercept = 1, linetype = 2)
+)
+
+#ggsave(datadir('figures/revisit_count_model_all_fires.png'), height = 4, width = 5)
+
+```
+
+
+
+### Compute partial r2 for seedling models
+```{r}
+#compute partial R2 for initial seedling count (sqrt)
+r2_nakagawa(m_fir)$R2_marginal - r2_nakagawa(m_fir_ns)$R2_marginal #0.00133
+r2_nakagawa(m_pine)$R2_marginal - r2_nakagawa(m_pine_ns)$R2_marginal # 0.3052775 
+r2(m_sim)$R2_marginal - r2(m_sim_ns)$R2_marginal #0.4602
+```
+
+
+Model probability of a plot having net mortality & net recruitment of all conifers between the two visits
+```{r}
+#create binary vairable for net mortality and net recruitment
+df_mort = lumped_df %>% mutate(net_mortality = case_when(net_seedling_dif < 0 ~ 1, TRUE ~ 0),
+                               net_recruitment = case_when(net_seedling_dif > 0 ~ 1, TRUE ~ 0))
+
+#model drivers of net mortality and recruitment
+m_mort = glmmTMB(net_mortality ~ seedling_count_initial +  Shrubs + heat_load + DistPre + yrs2initial + time_between_samples + (1|Fire), data = df_mort,
+                 family = "binomial")
+
+
+
+m_recr = glmmTMB(net_recruitment ~ Shrubs + heat_load + DistPre + yrs2initial + time_between_samples + (1|Fire), data = df_mort,
+                 family = "binomial")
+
+#plot residuals and summarise model output
+plotResiduals(m_mort) 
+summary(m_mort)
+plot_model(m_mort)
+
+plotResiduals(m_recr) 
+summary(m_recr)
+
+#compare means with emmeans
+emmeans(m_mort, ~ Shrubs, at = list(Shrubs = 10), type = "response")
+emmeans(m_mort, ~ seedling_count_initial, at = list(seedling_count_initial = 10), type = "response")
+
+
+#plot models
+(pa = plot_model(m_mort, type = "pred", terms = "Shrubs [all]", colors = "gs") +
+    theme_bw(15)+
+    theme( panel.grid.minor = element_blank())+
+    ggtitle("Pr(net mortality)")+
+    xlab("perc. shrub cover")+
+    geom_rug(alpha = .5, sides = "b")
+  )
+
+
+(pb = plot_model(m_recr, type = "pred", terms = "heat_load [all]", colors = "gs") + theme_bw(15) +
+    theme( panel.grid.minor = element_blank())+
+    ggtitle("Pr(net recruitment)")+
+    geom_rug(alpha = .5, sides = "b")
+  )
+
+
+(pc = plot_model(m_recr, type = "pred", terms = "DistPre [all]", colors = "gs") + theme_bw(15) +
+    xlab("dist. to seed source (m)")+
+    theme( panel.grid.minor = element_blank())+
+    ggtitle("Pr(net recruitment)")+
+    geom_rug(alpha = .5, sides = "b")
+  )
+
+
+#combine plots
+pa + pb + pc + plot_annotation(tag_levels = 'a')
+
+# ggsave(datadir('figures/recruit_mortality_marginal_effects.png'), height = 4, width = 12)
+
+```
+
+
+
+
+## (b) Explore establishment patterns from initila and revisit- seedling ages are not fully reliable given difficulty aging older seedlings
+```{r}
+#read in initial seedling age data
+initial_seed_age = read_csv(datadir("final_data/initial_budscar_compiled.csv")) %>%
+  mutate(Year = sample_yr)
+
+#remove plots that are not included in the cleaned revisit data and the revisit models above
+initial_seed_age_sub = initial_seed_age %>% filter(Plot_ID %in% df_clean$Plot_ID)
+
+#check that all plots are accounted for
+# t = df_clean %>% filter(!Plot_ID %in% initial_seed_age$Plot_ID)
+#all accounted for except plots with no initial seedlings
+
+#read in revisit seedling age data
+revisits_seed_age = read_csv(datadir("final_data/revisits_budscar_compiled.csv"))
+
+#remove plots that are not included in the cleaned revisit data and the revisit models above
+revisits_seed_age = revisits_seed_age %>% filter(Plot_ID %in% df_clean$Plot_ID)
+
+#check that all plots are accounted for
+# t = df_clean %>% filter(!Plot_ID %in% revisits_seed_age$Plot_ID)
+#all accounted for except plots with no revisit seedlings
+
+seed_age = bind_rows(revisits_seed_age, initial_seed_age_sub) %>%
+  dplyr::select(Plot_ID, Species, BudScars, Year, Visit) %>%
+  mutate(Plot_ID = toupper(Plot_ID)) %>% 
+  mutate(sp_func = Species,
+         sp_func = sub("ABCO/PSME", "fir", sp_func), #adding psme to firs in Sierra plots
+         sp_func = sub("ABIES", "fir", sp_func), #combining all firs
+         sp_func = sub("ABCO", "fir", sp_func), 
+         sp_func = sub("ABMA", "fir", sp_func), 
+         sp_func = sub("CADE", "cedar", sp_func),
+         sp_func = sub("PICO", "pine", sp_func), #combine all pines
+         sp_func = sub("PIMO", "pine", sp_func),
+         sp_func = sub("PIPJ", "pine", sp_func),
+         sp_func = sub("PINUS", "pine", sp_func),
+         sp_func = sub("PILA", "pine", sp_func),
+         sp_func = sub("PSME", "Douglas-fir", sp_func),
+         sp_func = sub("ARME", "hrdwd", sp_func), #lump hardwoods
+         sp_func = sub("LIDE", "hrdwd", sp_func),
+         sp_func = sub("QUCH", "hrdwd", sp_func),
+         sp_func = sub("QUKE", "hrdwd", sp_func),
+         sp_func = sub("SASC", "hrdwd", sp_func),
+         sp_func = sub("CONU", "hrdwd", sp_func),
+         sp_func = sub("QUGA", "hrdwd", sp_func),
+         sp_func = sub("ALRH", "hrdwd", sp_func),
+         sp_func = sub("COCO", "hrdwd", sp_func),
+         sp_func = sub("SALA", "hrdwd", sp_func),
+         sp_func = sub("SALIX", "hrdwd", sp_func),
+         sp_func = sub("SANI", "hrdwd", sp_func),
+         sp_func = sub("SANIC", "hrdwd", sp_func)) %>%
+  filter(sp_func == "fir" | sp_func == "pine" | sp_func == "Douglas-fir")
+
+
+
+#clean seed establishment data
+seed_age_sub = seed_age %>% filter(Plot_ID %in% df_clean$Plot_ID) %>%
+  left_join(df_clean %>% filter(sp_func == "pine") %>% dplyr::select(Plot_ID, Fire, fire_year)) %>%
+  mutate(yrs2fire = Year - fire_year,
+         post_fire_estab = yrs2fire - BudScars,
+         #for one sim plot where establishment year is -1, change to 0
+         BudScars = case_when(post_fire_estab < 0 ~ BudScars - 1,
+                             TRUE ~ BudScars),
+         post_fire_estab = yrs2fire - BudScars,
+         estab_year = Year - BudScars)
+
+#change DF to fir in all plots except Sims because Douglas-fir was not recorded in any initial sample
+seed_age_sub = seed_age_sub %>%
+  #change DF to fir in all plots except Sims
+  filter(Fire != "SIM") %>%
+  mutate(sp_func = sub("Douglas-fir", "fir", sp_func)) %>%
+  bind_rows(seed_age_sub %>% filter(Fire == "SIM"))
+
+# #test to make sure counts match cleaned df
+# t2 = df_clean %>% group_by(Fire, sp_func) %>%
+#   summarise(initial = sum(seedling_count_initial),
+#             revisit = sum(seedling_count_revisit))
+
+```
+
+
+Scale by number of sample plots - time since fire establishment
+```{r}
+#get plots per fire for scaling
+plots_per_fire = lumped_df %>%
+  group_by(Fire) %>%
+  summarise(plots_per_fire = n())
+
+
+#create dfs with plot counts by establishment year and time since fire
+seed_age_y2f_scale = seed_age_sub  %>%
+  group_by(Fire, Visit, post_fire_estab, sp_func) %>%
+  summarise(count_regen = n()) %>%
+  left_join(plots_per_fire) %>%
+  mutate(count_per_plot = count_regen/plots_per_fire)
+
+seed_age_y2f_scale_sum = seed_age_y2f_scale %>% group_by(Visit, post_fire_estab, sp_func) %>%
+  summarise(count_regen_scale = sum(count_per_plot))
+
+#plot separately for each fire
+(pa = ggplot(seed_age_y2f_scale %>%
+               mutate(Fire = factor(Fire, levels = c('SIM', 'SHR', 'Power',
+                                                     'Pendola', 'MNL', 'GON', 'Freds')),
+                      sp_func = factor(sp_func, levels = c('pine', 'fir', 'Douglas-fir')),
+                      Visit = case_when(Visit == "revisit" ~ "resurvey",
+                                        TRUE ~ Visit)), 
+             aes(y = sqrt(count_per_plot), x = post_fire_estab,  color = Visit)) + 
+    # geom_bar(position = "dodge") + 
+     geom_line(linewidth = .7)+
+    geom_point(size = 2.0)+
+    theme_bw(13) +
+  scale_color_manual(values = c("grey", "#2d4654"))+
+    scale_y_continuous(labels = function(x) x^2)+
+  labs(color='sample') +
+  facet_grid(Fire~sp_func)+
+  xlab("no. of years after fire seedlings established")+
+  ylab("seedlings per plot")+
+  theme(strip.background = element_rect(fill = "white")))
+
+# ggsave(datadir('figures/estab_plot_separate_fires.svg'), width = 9, height = 6)
+
+```
+
+
+```{r}
+
+#create dfs with plot counts by establishment year
+seed_age_estabyr_scale = seed_age_sub %>% 
+  group_by(Fire, Visit, estab_year, sp_func) %>%
+  summarise(count_regen = n()) %>%
+  left_join(plots_per_fire) %>%
+  mutate(count_per_plot = count_regen/plots_per_fire)
+
+seed_age_estabyr_scale_sum = seed_age_estabyr_scale %>% group_by(Visit, estab_year, sp_func) %>%
+  summarise(count_regen_scale = sum(count_per_plot))
+
+### PLOT
+#establishment year by fire
+(pb = ggplot(seed_age_estabyr_scale %>%
+               mutate(Visit = case_when(Visit == "revisit" ~ "re-sample",
+                                        TRUE ~ Visit)), aes(y = sqrt(count_per_plot), x = estab_year,  color = Visit)) + 
+    # geom_bar(position = "dodge") + 
+     geom_line(linewidth = .7)+
+    geom_point(size = 2.0)+
+    theme_bw(13) +
+  scale_color_manual(values = c("grey", "#2d4654"))+
+  labs(color='sample')+
+  scale_y_continuous(labels = function(x) x^2)+
+  facet_grid(Fire~sp_func)+
+  xlab("post-fire establishment year")+
+  ylab("seedlings per plot")+
+    annotate(geom = "rect", 
+           xmin = 2012,
+                xmax = 2016,
+                ymin = -Inf,
+                ymax = Inf,
+            alpha = 0.2, fill = "red")+    
+  theme(strip.background = element_rect(fill = "white")))
+
+# ggsave(datadir('figures/drought_plot_separate_fires.svg'), width = 9, height = 6)
+
+```
+
+
+## (c) Examine change in conifer density over time by genus
+```{r}
+df_density = df_clean %>% mutate(sp_func = case_when(Fire == "SIM" & sp_func == "fir" ~ "Douglas-fir", TRUE ~ sp_func )) %>%
+  #change pendola fire ids to match each other - these are the same fire
+  mutate(FIRE_ID = case_when(FIRE_ID == 'PNT' | FIRE_ID == 'PNP' ~ 'PEN', TRUE ~ FIRE_ID)) %>%
+  dplyr::select(FIRE_ID, Plot_ID, initial_density, revisit_density, sp_func) %>%
+  #convert to long format for boxplots
+  pivot_longer(initial_density:revisit_density, names_to = 'visit', values_to = 'density')
+
+#plot
+ggplot(df_density %>%
+         mutate(ecoregion = case_when(FIRE_ID == "SIM" ~ "Klamath Mnts.",
+                                      TRUE ~ "Sierra Nevada")),
+       aes(x = sp_func, y = sqrt(density), fill = visit))+
+  geom_boxplot()+
+  # stat_summary(fun.y = mean, geom = "errorbar", aes(ymax = ..y.., ymin = ..y..),
+  #              width = 0.75, size = 1, linetype = "solid")
+  scale_fill_manual(values = c("grey", "#425865"))+
+  theme_bw(13)+
+  scale_y_continuous(labels = function(x) x^2)+
+  xlab("")+
+  ylab(bquote(`seedlings m`^`-2`))+
+  facet_wrap(~ecoregion)+ 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+#summarise
+summary = df_density %>% group_by(sp_func, visit) %>%
+  summarise(mean = mean(density))
+  
+#create a summary of plot level conifer seedling density  
+df_density_plot_level = df_density %>%
+  group_by(Plot_ID, FIRE_ID, visit) %>%
+  summarise(density_total = sum(density)) %>%
+  mutate(seedling_presence = density_total > 0)
+
+table(df_density_plot_level$seedling_presence, df_density_plot_level$visit)
+
+#join to plot predictor data
+df_density = df_density %>% left_join(df_clean %>% dplyr::select(Plot_ID, Fire, time_between_samples, yrs2initial) %>% distinct())
+
+#pivot wider for computing differences
+df_density_wide = df_density %>% pivot_wider(names_from = visit, values_from = density) %>%
+  mutate(density_diff = revisit_density - initial_density)
+
+df_density_diff = df_density%>% filter(Fire != "Sim") %>% group_by(visit, sp_func) %>%
+  summarise(dif = sum(density))
+
+
+```
+
+#### Model changes in conifer density between visits
+```{r}
+#model change in pine density between visits
+m_pden= glmmTMB(density ~ visit + time_between_samples + yrs2initial + (1|Plot_ID), data = df_density %>% filter(sp_func == "pine") %>% filter(Fire != "SIM"), family = tweedie)
+
+plotResiduals(m_pden) 
+summary(m_pden)
+
+#model change in fir density between visits
+m_fden= glmmTMB(density ~ visit + time_between_samples + yrs2initial + (1|Plot_ID), data = df_density %>% filter(sp_func == "fir") %>% filter(Fire != "SIM"), family = tweedie)
+
+plotResiduals(m_fden) 
+summary(m_fden)
+
+#model change in douglas fir density between visits
+m_dfden= glmmTMB(density ~ visit + (1|Plot_ID), data = df_density %>% filter(sp_func == "Douglas-fir") %>% filter(Fire == "SIM"), family = tweedie)
+
+plotResiduals(m_dfden) 
+summary(m_dfden)
+```
+
+compare conifer density means with emmeans
+```{r}
+#emmeans table
+em_dfden = emmeans(m_dfden, specs = revpairwise ~ visit, data = df_density %>% filter(sp_func == "Douglas-fir") %>% filter(Fire == "SIM"), type = "response")
+
+em_fden = emmeans(m_fden, specs = revpairwise ~ visit, data = df_density %>% filter(sp_func == "fir") %>% filter(Fire != "SIM"), type = "response")
+
+#at = list(yrs2initial = c(6,10))
+
+em_pden = emmeans(m_pden, specs = revpairwise ~ visit, data = df_density %>% filter(sp_func == "pine") %>% filter(Fire != "SIM"), type = "response")
+
+
+#combine emmeans into table
+bind_rows(data.frame(em_pden$contrasts), data.frame(em_fden$contrasts), 
+          data.frame(em_dfden$contrasts))
+```
+
+
+
+## (d) Explore trends in shrubs and veg structure!
+```{r}
+#load in shrub species cover data
+shrub_df = read_csv(datadir("final_data/shrub_data_compiled.csv")) %>%
+  #change PNT and PNP to 'Pendola' these are from the same fire
+  mutate(Fire = case_when(Fire == "PNT" | Fire == "PNP" ~ "Pendola", 
+                          Fire == "PWR" ~ "Power",
+                          Fire == "SIMS" ~ "SIM", 
+                          .default = Fire))
+
+#keep plots included in revisit conifer analysis
+# i = df_clean$Plot_ID %in% shrub_df$PlotID 
+# df_clean$Plot_ID[!i] #missing 2 freds plots: gon and sim plot have no shrubs in initial visit
+
+# i = shrub_df$PlotID %in% df_clean$Plot_ID 
+# shrub_df$PlotID[!i]
+
+#keep only plots in the cleaned data with regen data
+shrub_df_sub = shrub_df %>% filter(PlotID %in% df_clean$Plot_ID)
+
+#make sure each plot is listed twice
+t = shrub_df_sub %>% dplyr::select(PlotID, Sample_year, Fire) %>%
+  distinct() %>%
+  group_by(PlotID) %>%
+  summarise(n = n())
+#Sim18 and Gon06 had no shrub cover in initial visit
+
+
+shrub_sp = shrub_df %>% dplyr::select(Species) %>% distinct()
+
+#remove occurrences with less than 10% cover - some revisited plots only count shrub cover if >10%
+shrub_dom = shrub_df_sub %>% 
+  filter(Cover >=10) %>%
+  #lump species by genus
+  mutate(genus = substr(Species, 1,2))
+
+shrub_fun = shrub_dom %>% group_by(Fire, visit, PlotID, Sample_year, genus) %>%
+  summarise(Cover = sum(Cover))
+
+#convert to wide and then back to get differences
+shrubw = shrub_fun %>% pivot_wider(id_cols = -c(Sample_year, -Fire), names_from = visit, values_from = Cover) %>%
+  #replace nas with 0s
+  mutate(initial = ifelse(is.na(initial), 0, initial),
+         revisit = ifelse(is.na(revisit), 0, revisit),) %>%
+  mutate(dif = revisit - initial,
+         Plot_ID = PlotID)
+
+#add sample years
+shrub_yr = left_join(shrubw, df_clean %>% dplyr::select(Plot_ID, initial_sample_yr, sample_yr_revisit, Fire, yrs2initial) %>% distinct()) %>%
+  mutate(time_between_samples = as.numeric(sample_yr_revisit) - as.numeric(initial_sample_yr)) %>%
+  #rename genus for ploting
+  mutate(genus = case_when(genus == "AR" ~ "Arctostaphylos",
+                           genus == "CE" ~ "Ceanothus",
+                           genus == "CH"~ "Chamaebatia",
+                           genus == "TO" ~ "Toxicodendron",
+                           TRUE ~ "Other"),
+         ecoregion = case_when(Fire == "SIM" ~ "Klamath Mnts.",
+                               TRUE ~ "Sierra Nevada")) %>%
+  #remove other species
+  filter(genus != "Other")
+
+#PLOT
+(shrub_p = ggplot(shrub_yr, aes(x = genus, y = dif/time_between_samples))+
+    geom_boxplot()+
+    geom_jitter(alpha = 0.6,size = 3, aes(color = Fire), width = .25)+
+  theme_bw(13)+
+  ylab("annual change in shrub cover")+
+  xlab(""))
+  #scale_color_viridis(discrete = TRUE, option = "D"))
+  # scale_color_manual(values = pal)
+
+(p_shrub = ggplot(shrub_yr %>% 
+                    pivot_longer( cols = revisit:initial, names_to = 'visit', values_to = 'cover') %>%
+                    filter(genus != "Chamaebatia") %>%
+                    mutate(visit = case_when(visit == "revisit" ~ "resurvey", TRUE ~ visit)), 
+                  aes(x = genus, y = cover, fill = visit))+
+    geom_boxplot()+
+  theme_bw(13)+
+      scale_fill_manual(values = c("grey", "#425865"))+
+  xlab("")+
+  facet_wrap(~ecoregion)+ 
+  theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1)))
+
+p_shrub + theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1))
+
+  #scale_color_viridis(discrete = TRUE, option = "D"))
+  # scale_color_manual(values = pal)
+
+#ggsave(datadir("figures/shrub_revisit_cse.png"), width = 6, height = 4, units = "in")
+```
+
+### Model differences in shrub species cover
+```{r}
+#convert to long format for subsetting by species
+shrub_l = shrub_yr %>% dplyr::select(-dif) %>%
+  pivot_longer(initial:revisit, names_to = 'visit', values_to = 'cover')
+
+## Model arctostaphylos change over time
+m_arc = glmmTMB(cover ~ visit  + time_between_samples + yrs2initial + (1|Plot_ID), data = shrub_l %>% filter(genus == "Arctostaphylos") %>% filter(Fire != "SIM"), family = tweedie)
+
+#check model assumptions
+plotResiduals(m_arc) 
+summary(m_arc)
+
+## Model ceanothus change over time
+m_ce = glmmTMB(cover ~ visit  + time_between_samples + yrs2initial + (1|Plot_ID), data = shrub_l %>% filter(genus == "Ceanothus") %>% filter(Fire != "SIM"), family = tweedie)
+
+plotResiduals(m_ce) 
+summary(m_ce)
+
+#not enough data points to model chamaebatia
+# m_ch = glmmTMB(cover ~ visit  + time_between_samples + yrs2initial + (1|Plot_ID), data = shrub_l %>% filter(genus == "Chamaebatia") %>% filter(Fire != "SIM"), family = tweedie)
+# 
+# plotResiduals(m_ch) 
+# summary(m_ch)
+
+
+#Repeat models for Klamath ecoregion
+## Model poison oak change over time
+m_tox = glmmTMB(cover ~ visit + (1|Plot_ID), data = shrub_l %>% filter(genus == "Toxicodendron") %>% filter(Fire == "SIM"), family = tweedie)
+
+plotResiduals(m_tox) 
+summary(m_tox)
+
+
+#model ceanothus for Klamath
+m_ce_sim = glmmTMB(cover ~ visit + (1|Plot_ID), data = shrub_l %>% filter(genus == "Ceanothus") %>% filter(Fire == "SIM"), family = tweedie)
+
+plotResiduals(m_ce_sim) 
+summary(m_ce_sim)
+
+```
+
+Compare model means with emmeans 
+```{r}
+em_arc = emmeans(m_arc, specs = revpairwise ~ visit , data = shrub_l %>% filter(genus == "Arctostaphylos") %>% filter(Fire != "SIM"), type = "response")
+
+em_ce = emmeans(m_ce, specs = revpairwise ~ visit , data = shrub_l %>% filter(genus == "Ceanothus") %>% filter(Fire != "SIM"), type = "response")
+
+em_tox = emmeans(m_tox, specs = revpairwise ~ visit , data = shrub_l %>% filter(genus == "Toxicodendron") %>% filter(Fire == "SIM"), type = "response")
+
+em_ce_sim = emmeans(m_ce_sim, specs = revpairwise ~ visit , data = shrub_l %>% filter(genus == "Ceanothus") %>% filter(Fire == "SIM"), type = "response")
+
+#combine emmeans into table
+bind_rows(data.frame(em_arc$contrasts), data.frame(em_ce$contrasts), 
+          data.frame(em_tox$contrasts), data.frame(em_ce_sim$contrasts))
+```
+
+
+
+### Examine change in vegetation structrue over time
+```{r}
+#read in veg structure data
+lf = read_csv(datadir("final_data/lifeform_compiled.csv"))
+
+#remove gondola and showers because they don't have adequate initial visit data
+lf_sub = lf %>% filter(Fire != "GON" & Fire != "SHR") %>%
+  #keep only plots included in revisits conifer analyses
+  filter(Plot_ID %in% df_clean$Plot_ID)
+
+#make sure there are 2 records of each plot (initial and revisit)
+t = lf_sub %>% dplyr::select(Plot_ID, Fire, visit) %>%
+  distinct() %>%
+  group_by(Plot_ID) %>%
+  summarise(n = n())
+
+#covert to long format so that all lifeforms are in one column
+lf_long = lf_sub %>% 
+  pivot_longer(Grams:Forbs, names_to = "lifeform", values_to = "cover") %>%
+    mutate(cover = ifelse(is.na(cover), 0, cover))
+
+#pivot wider so that cover at each visit has its own column
+lf_wide = lf_long %>% dplyr::select(-Sample_year, -Fire) %>%
+  pivot_wider(names_from = 'visit', values_from = "cover") %>%
+  #remove NAs
+  mutate(initial = ifelse(is.na(initial), 0, initial),
+         revisit = ifelse(is.na(revisit), 0, revisit)) %>%
+  #add back in Fire and sample years
+  left_join(df_clean %>% dplyr::select(Plot_ID, initial_sample_yr, sample_yr_revisit, Fire, yrs2initial, time_between_samples) %>% distinct())
+
+#join to cleaned data for plot level covariates
+lf_long_join = left_join(lf_long, df_clean %>% dplyr::select(Plot_ID, initial_sample_yr, sample_yr_revisit, Fire, yrs2initial, time_between_samples) %>% distinct()) %>%
+  mutate(ecoregion = case_when(Fire == "SIM" ~ "Klamath Mnts.",
+                               TRUE ~ "Sierra Nevada"))
+
+#summarise
+# lf_long %>% filter(Fire == "SIM", 
+#                    lifeform == "Shrubs",
+#                    visit == "revisit") %>%
+#   summary()
+```
+
+#### Plot structural compotents
+```{r}
+(p_lifeform = ggplot(lf_long_join %>%
+                       mutate(visit = case_when(visit == "revisit" ~ "resurvey", TRUE ~ visit))
+                     , aes(x = lifeform, y = sqrt(cover), fill = visit))+
+  geom_boxplot()+
+    scale_fill_manual(values = c("grey", "#425865"))+
+  theme_bw(13)+
+  xlab("")+
+  facet_wrap(~ecoregion))
+
+# ggsave(datadir("figures/lifeform_all.png"), width = 6, height = 4, units = "in")
+
+(p_lifeform +
+  theme(legend.title=element_blank())) / (p_shrub +
+  theme(legend.title=element_blank())) +plot_annotation(tag_levels = 'a') + plot_layout(guides = "collect")
+
+# ggsave(datadir("figures/lifeform_and_shrub.png"), width = 6, height = 7, units = "in")
+```
+
+### model difference in veg structural component cover by ecoregion
+```{R}
+#convert cover to proportion for modeling
+lf_long_join = lf_long_join %>%
+  mutate(cover_prop = cover/100)
+
+## Model lifeform change over time for Klamath/Sims fire
+#model shrubs change over time
+m_shrub_sim = glmmTMB(cover ~ visit  + (1|Plot_ID), data = lf_long_join %>% filter(lifeform == "Shrubs") %>% filter(ecoregion == "Klamath Mnts."), family = tweedie)
+
+plotResiduals(m_shrub_sim) 
+summary(m_shrub_sim)
+
+#model grams change over time
+m_gram_sim = glmmTMB(cover ~ visit  + (1|Plot_ID), data = lf_long_join %>% filter(lifeform == "Grams") %>% filter(ecoregion == "Klamath Mnts."), family = tweedie)
+
+plotResiduals(m_gram_sim) 
+summary(m_gram_sim)
+
+#model forbs change over time
+m_forb_sim = glmmTMB(cover ~ visit  + (1|Plot_ID), data = lf_long_join %>% filter(lifeform == "Forbs") %>% filter(ecoregion == "Klamath Mnts."), family = tweedie)
+
+plotResiduals(m_forb_sim) 
+summary(m_forb_sim)
+
+## Repeat for Sierra fires
+#model shrubs change over time
+m_shrub = glmmTMB(cover ~ factor(visit)  + time_between_samples + yrs2initial + (1|Plot_ID), data = lf_long_join %>% filter(lifeform == "Shrubs") %>% filter(ecoregion == "Sierra Nevada"), family = tweedie)
+
+plotResiduals(m_shrub) 
+summary(m_shrub)
+
+#model grams change over time
+m_gram = glmmTMB(cover~ visit   + time_between_samples + yrs2initial + (1|Plot_ID), data = lf_long_join %>% filter(lifeform == "Grams") %>% filter(ecoregion == "Sierra Nevada"), family = tweedie)
+
+plotResiduals(m_gram) 
+summary(m_gram)
+
+#model forbs change over time
+m_forb = glmmTMB(cover ~ visit   + time_between_samples + yrs2initial + (1|Plot_ID), data = lf_long_join %>% filter(lifeform == "Forbs") %>% filter(ecoregion == "Sierra Nevada"), family = tweedie)
+
+plotResiduals(m_forb) 
+summary(m_forb)
+
+```
+
+Perform emmeans comparisons
+```{r}
+em_shrub_sim = emmeans(m_shrub_sim, specs = revpairwise ~ visit , data = lf_long_join %>% filter(lifeform == "Shrubs") %>% filter(ecoregion == "Klamath Mnts."), type = "response")
+
+em_forb_sim = emmeans(m_forb_sim, specs = revpairwise ~ visit , data = lf_long_join %>% filter(lifeform == "Forbs") %>% filter(ecoregion == "Klamath Mnts."), type = "response")
+
+em_gram_sim = emmeans(m_gram_sim, specs = revpairwise ~ visit , data = lf_long_join %>% filter(lifeform == "Grams") %>% filter(ecoregion == "Klamath Mnts."), type = "response")
+
+em_shrub = emmeans(m_shrub, specs = revpairwise ~ visit , data = lf_long_join %>% filter(lifeform == "Shrubs") %>% filter(ecoregion == "Sierra Nevada"), type = "response")
+
+em_forb = emmeans(m_forb, specs = revpairwise ~ visit , data = lf_long_join %>% filter(lifeform == "Forbs") %>% filter(ecoregion == "Sierra Nevada"), type = "response")
+
+em_gram = emmeans(m_gram, specs = revpairwise ~ visit , data = lf_long_join %>% filter(lifeform == "Grams") %>% filter(ecoregion == "Sierra Nevada"), type = "response")
+
+
+#combine emmeans into table
+bind_rows(data.frame(em_shrub_sim$contrasts), data.frame(em_forb_sim$contrasts), 
+          data.frame(em_gram_sim$contrasts), data.frame(em_shrub$contrasts), data.frame(em_forb$contrasts), data.frame(em_gram$contrasts))
+```
+
